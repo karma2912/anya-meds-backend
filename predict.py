@@ -3,27 +3,28 @@ from torchvision import transforms, models
 from PIL import Image
 import os
 import numpy as np
+import cv2
+import matplotlib.pyplot as plt
 
-# Configuration
+from pytorch_grad_cam import GradCAMPlusPlus
+from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+from pytorch_grad_cam.utils.image import show_cam_on_image
+
 NIH_MODEL_PATH = "model/densenet121.pth"
 COVID_MODEL_PATH = "best_covid_model.pth"
 IMAGE_PATH = "test.png"
-THRESHOLD = 0.4  # For NIH multi-label classification
-USE_COVID_MODEL = True  # ✅ Change to False if you want to run NIH model
+THRESHOLD = 0.4
+USE_COVID_MODEL = True  
 
-# Labels
 NIH_LABELS = [
     'Atelectasis', 'Cardiomegaly', 'Effusion', 'Infiltration', 'Mass',
     'Nodule', 'Pneumonia', 'Pneumothorax', 'Consolidation', 'Edema',
     'Emphysema', 'Fibrosis', 'Pleural_Thickening', 'Hernia', 'No Finding'
 ]
-
 COVID_LABELS = ['Normal', 'COVID', 'Lung_Opacity', 'Viral_Pneumonia']
 
-# Device setup
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Common transform
 transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
@@ -54,7 +55,7 @@ def load_nih_model():
 def load_covid_model():
     print("🦠 Loading COVID-19 model...")
     model = models.densenet121(weights=None)
-    model.classifier = torch.nn.Linear(1024, 4)  # 4 classes
+    model.classifier = torch.nn.Linear(1024, 4)
     checkpoint = torch.load(COVID_MODEL_PATH, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
     model = model.to(device)
@@ -79,7 +80,33 @@ def predict_covid(image_path, model):
         outputs = model(image_tensor)
         probs = torch.softmax(outputs, dim=1).cpu().numpy()[0]
     class_idx = np.argmax(probs)
-    return COVID_LABELS[class_idx], float(probs[class_idx]), probs
+    return COVID_LABELS[class_idx], float(probs[class_idx]), probs, image_tensor
+
+def generate_gradcam(model, image_tensor, target_layer, class_idx, orig_image_path="test.png"):
+    model.eval()
+    image_tensor = image_tensor.to(device)
+
+    high_res_size = (512, 512)
+    orig = Image.open(orig_image_path).convert("RGB").resize(high_res_size)
+    orig_np = np.array(orig).astype(np.float32) / 255.0 
+
+    cam = GradCAMPlusPlus(model=model, target_layers=[target_layer])
+    grayscale_cam = cam(input_tensor=image_tensor, targets=[ClassifierOutputTarget(class_idx)])[0]
+
+    grayscale_cam = cv2.resize(grayscale_cam, high_res_size)
+
+    cam_image = show_cam_on_image(orig_np, grayscale_cam, use_rgb=True)
+
+    output_path = "gradcam_output.png"
+    cv2.imwrite(output_path, cv2.cvtColor(cam_image, cv2.COLOR_RGB2BGR))
+    print(f"🧠 Grad-CAM saved to {output_path}")
+
+    plt.figure(figsize=(8, 8))
+    plt.imshow(cam_image)
+    plt.axis("off")
+    plt.title("Grad-CAM++")
+    plt.show()
+
 
 if __name__ == "__main__":
     if not os.path.exists(IMAGE_PATH):
@@ -89,11 +116,18 @@ if __name__ == "__main__":
 
     if USE_COVID_MODEL:
         model = load_covid_model()
-        label, prob, all_probs = predict_covid(IMAGE_PATH, model)
-        print(f"🦠 Predicted condition: {label} ({prob:.1%} confidence)")
-        print("\n🔍 Class probabilities:")
+        label, prob, all_probs, image_tensor = predict_covid(IMAGE_PATH, model)
+        print(f"🦠 Predicted condition: {label} ({prob:.1%} confidence)\n")
+        print("🔍 Class probabilities:")
         for i, p in enumerate(all_probs):
             print(f"- {COVID_LABELS[i]:<20}: {p:.1%}")
+        class_idx = np.argmax(all_probs)
+
+        target_layer = model.features.denseblock4.denselayer16.conv2
+
+
+        generate_gradcam(model, image_tensor, target_layer=target_layer, class_idx=class_idx)
+
     else:
         model = load_nih_model()
         predictions, all_probs = predict_nih(IMAGE_PATH, model)
@@ -103,6 +137,7 @@ if __name__ == "__main__":
                 print(f"- {condition:<20}: {prob:.1%}")
         else:
             print("✅ No abnormalities detected above threshold")
+
         print("\n🔍 Top 3 predictions:")
         top3_indices = np.argsort(all_probs)[-3:][::-1]
         for idx in top3_indices:
