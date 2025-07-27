@@ -1,6 +1,9 @@
+flask
+flask-cors
 torch
 torchvision
-pandas
-scikit-learn
-pillow
-tqdm
+numpy
+opencv-python
+Pillow
+grad-cam
+gunicorn  # <-- Add this line
