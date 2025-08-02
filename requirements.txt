@@ -6,4 +6,4 @@ numpy
 opencv-python
 Pillow
 grad-cam
-gunicorn  # <-- Add this line
+gunicorn 
