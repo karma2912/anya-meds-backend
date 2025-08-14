@@ -1,3 +1,4 @@
 small-dataset
 .venv
 error_analysis
+.env

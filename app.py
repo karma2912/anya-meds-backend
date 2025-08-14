@@ -9,6 +9,10 @@ import base64
 from io import BytesIO
 import traceback
 
+# --- NEW: Imports for Gemini ---
+import google.generativeai as genai
+from dotenv import load_dotenv
+
 # Imports required for the Skin model
 import timm
 import albumentations as A
@@ -30,6 +34,15 @@ CORS(app)  # Allow cross-origin requests from your frontend
 MODEL_DIR = os.path.join(os.path.dirname(__file__), 'model')
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"✅ Using device: {device}")
+
+# --- NEW: Configure Gemini API ---
+load_dotenv()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if not GEMINI_API_KEY:
+    print("⚠️ WARNING: GEMINI_API_KEY environment variable not set. AI Summaries will be disabled.")
+else:
+    genai.configure(api_key=GEMINI_API_KEY)
+    print("✅ Gemini API configured successfully.")
 
 # =============================================================================
 # SKIN LESION MODEL DEFINITION (Must be defined for loading)
@@ -169,6 +182,29 @@ def predict_model(image_tensor, model, labels):
     predicted_idx = np.argmax(probs)
     return labels[predicted_idx], float(probs[predicted_idx]), probs
 
+# --- NEW: Gemini AI Summary Function ---
+def generate_ai_summary(model_name, diagnosis, confidence):
+    """Generates a human-readable summary using the Gemini API."""
+    if not GEMINI_API_KEY:
+        return "AI Summary feature is disabled. Please configure your Gemini API Key."
+
+    prompts = {
+        "chest": f"As a medical scribe summarizing an AI analysis of a chest X-ray, write a brief, objective clinical summary in 1-2 sentences. The model's primary finding is '{diagnosis}' with a confidence of {confidence*100:.1f}%.",
+        "brain": f"As a medical scribe summarizing an AI analysis of a brain MRI, write a brief, objective clinical summary in 1-2 sentences. The model's primary finding is a tumor classified as '{diagnosis}' with a confidence of {confidence*100:.1f}%.",
+        "skin": f"As a medical scribe summarizing an AI analysis of a dermoscopic image, write a brief, objective clinical summary in 1-2 sentences. The AI identified the lesion as '{diagnosis}' with a confidence of {confidence*100:.1f}%.",
+    }
+    
+    prompt = prompts.get(model_name, f"Provide a brief summary for the medical finding: {diagnosis}")
+
+    try:
+        model = genai.GenerativeModel('gemini-1.5-flash-latest')
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        print(f"❌ Gemini API Error: {e}")
+        return "Could not generate AI summary due to an API error."
+
+
 # =============================================================================
 # LOAD ALL MODELS ON STARTUP
 # =============================================================================
@@ -237,6 +273,9 @@ def process_request(request, model_name):
         else:
              return jsonify({"error": "Invalid model name specified"}), 400
 
+        # --- NEW: Call Gemini for AI Summary ---
+        # ai_summary = generate_ai_summary(model_name, label, prob)
+        ai_summary = "AI summary is temporarily disabled for testing."
         result = {
             "label": label,
             "confidence": round(prob, 4),
@@ -244,13 +283,14 @@ def process_request(request, model_name):
                 {"label": labels_list[i], "value": round(float(p), 4)}
                 for i, p in enumerate(all_probs)
             ],
-            "heatmap": heatmap_base64
+            "heatmap": heatmap_base64,
+            "ai_summary": ai_summary  # Add the summary to the response
         }
         return jsonify(result)
 
     except Exception as e:
         print(f"❌ An error occurred during {model_name} prediction: {e}")
-        traceback.print_exc() # Print full traceback for easier debugging
+        traceback.print_exc() 
         return jsonify({"error": f"An error occurred processing the image for {model_name}."}), 500
 
 @app.route("/api/chest", methods=["POST"])
