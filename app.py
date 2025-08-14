@@ -1,16 +1,23 @@
 import torch
 import torch.nn as nn
-from torchvision import transforms, models
+import torch.nn.functional as F
+from torchvision import models
 from PIL import Image
 import os
 import numpy as np
 import base64
 from io import BytesIO
+import traceback
+
+# Imports required for the Skin model
+import timm
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-# Grad-CAM libraries (ensure you have pytorch-grad-cam installed)
+# Grad-CAM libraries - Including GradCAMPlusPlus
 from pytorch_grad_cam import GradCAM, GradCAMPlusPlus
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
 from pytorch_grad_cam.utils.image import show_cam_on_image
@@ -25,28 +32,80 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"✅ Using device: {device}")
 
 # =============================================================================
-# CHEST X-RAY CONFIGURATION
+# SKIN LESION MODEL DEFINITION (Must be defined for loading)
 # =============================================================================
-CHEST_MODEL_PATH = os.path.join(MODEL_DIR, "best_covid_model.pth") # Using the better COVID model
-CHEST_LABELS = ['Normal', 'COVID', 'Lung_Opacity', 'Viral_Pneumonia']
+class EnhancedModel(nn.Module):
+    """Enhanced model with better regularization and multi-scale features."""
+    def __init__(self, model_name, num_classes, dropout_rate=0.3):
+        super(EnhancedModel, self).__init__()
+        self.backbone = timm.create_model(model_name, pretrained=True, num_classes=0, global_pool='')
+        
+        with torch.no_grad():
+            dummy_input = torch.randn(1, 3, 224, 224)
+            features = self.backbone(dummy_input)
+            feature_dim = features.shape[1]
 
-chest_transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        self.global_avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.global_max_pool = nn.AdaptiveMaxPool2d(1)
+
+        self.classifier = nn.Sequential(
+            nn.Dropout(dropout_rate),
+            nn.Linear(feature_dim * 2, feature_dim),
+            nn.BatchNorm1d(feature_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate * 0.5),
+            nn.Linear(feature_dim, feature_dim // 2),
+            nn.BatchNorm1d(feature_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout_rate * 0.25),
+            nn.Linear(feature_dim // 2, num_classes)
+        )
+
+    def forward(self, x):
+        features = self.backbone(x)
+        avg_pool = self.global_avg_pool(features).flatten(1)
+        max_pool = self.global_max_pool(features).flatten(1)
+        combined = torch.cat([avg_pool, max_pool], dim=1)
+        return self.classifier(combined)
+
+# =============================================================================
+# MODEL CONFIGURATIONS
+# =============================================================================
+
+# CHEST X-RAY CONFIGURATION
+CHEST_MODEL_PATH = os.path.join(MODEL_DIR, "best_covid_model.pth")
+CHEST_LABELS = ['Normal', 'COVID', 'Lung_Opacity', 'Viral_Pneumonia']
+chest_transform = A.Compose([
+    A.Resize(224, 224),
+    A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ToTensorV2()
 ])
 
-# =============================================================================
 # BRAIN TUMOR (MRI) CONFIGURATION
-# =============================================================================
 BRAIN_MODEL_PATH = os.path.join(MODEL_DIR, 'densenet_brain_tumor_v3.pth')
 BRAIN_LABELS = ['glioma', 'meningioma', 'notumor', 'pituitary']
+brain_transform = A.Compose([
+    A.Resize(224, 224),
+    A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ToTensorV2()
+])
 
-brain_transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.Grayscale(num_output_channels=3), # Brain model was trained on grayscale
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+# SKIN LESION (DERMOSCOPY) CONFIGURATION
+SKIN_MODEL_PATH = os.path.join(MODEL_DIR, 'skin-model.pth')
+SKIN_MODEL_NAME = 'tf_efficientnet_b3_ns'
+SKIN_IMG_SIZE = 256
+SKIN_NUM_CLASSES = 7
+SKIN_DROPOUT_RATE = 0.4
+SKIN_LABELS_SHORT = ['akiec', 'bcc', 'bkl', 'df', 'mel', 'nv', 'vasc']
+SKIN_LABELS_FULL = {
+    'akiec': 'Actinic Keratoses', 'bcc': 'Basal Cell Carcinoma',
+    'bkl': 'Benign Keratosis-like Lesions', 'df': 'Dermatofibroma',
+    'mel': 'Melanoma', 'nv': 'Melanocytic Nevi', 'vasc': 'Vascular Lesions'
+}
+skin_transform = A.Compose([
+    A.Resize(SKIN_IMG_SIZE, SKIN_IMG_SIZE),
+    A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ToTensorV2(),
 ])
 
 # =============================================================================
@@ -55,72 +114,66 @@ brain_transform = transforms.Compose([
 def load_chest_model():
     model = models.densenet121(weights=None)
     model.classifier = nn.Linear(1024, len(CHEST_LABELS))
-    # Load model trained for COVID/Pneumonia classification
     checkpoint = torch.load(CHEST_MODEL_PATH, map_location=device)
     model.load_state_dict(checkpoint['model_state_dict'])
-    model = model.to(device)
+    model.to(device)
     model.eval()
     return model
 
 def load_brain_model():
     model = models.densenet121(weights=None)
-    num_ftrs = model.classifier.in_features
-    model.classifier = nn.Linear(num_ftrs, len(BRAIN_LABELS))
+    model.classifier = nn.Linear(model.classifier.in_features, len(BRAIN_LABELS))
     model.load_state_dict(torch.load(BRAIN_MODEL_PATH, map_location=device))
-    model = model.to(device)
+    model.to(device)
+    model.eval()
+    return model
+
+def load_skin_model():
+    model = EnhancedModel(
+        model_name=SKIN_MODEL_NAME,
+        num_classes=SKIN_NUM_CLASSES,
+        dropout_rate=SKIN_DROPOUT_RATE
+    )
+    model.load_state_dict(torch.load(SKIN_MODEL_PATH, map_location=device))
+    model.to(device)
     model.eval()
     return model
 
 # =============================================================================
 # PREDICTION & GRAD-CAM FUNCTIONS
 # =============================================================================
-
-# --- CHEST X-RAY ---
-def predict_chest(image: Image.Image, model):
+def process_image(image: Image.Image, transform):
     image_rgb = image.convert("RGB")
-    image_tensor = chest_transform(image_rgb).unsqueeze(0).to(device)
-    with torch.no_grad():
-        outputs = model(image_tensor)
-        probs = torch.softmax(outputs, dim=1).cpu().numpy()[0]
-    class_idx = np.argmax(probs)
-    return CHEST_LABELS[class_idx], float(probs[class_idx]), probs, image_tensor
+    image_np = np.array(image_rgb)
+    transformed = transform(image=image_np)
+    return transformed['image'].unsqueeze(0).to(device)
 
-def generate_chest_gradcam(model, image_tensor, target_layer, class_idx, orig_image: Image.Image):
-    orig_np = np.array(orig_image.convert("RGB").resize((224, 224))).astype(np.float32) / 255.0
-    cam = GradCAMPlusPlus(model=model, target_layers=[target_layer])
-    grayscale_cam = cam(input_tensor=image_tensor, targets=[ClassifierOutputTarget(class_idx)])[0]
+def generate_gradcam(model, target_layer, image_tensor, orig_image: Image.Image, class_idx, img_size=224, cam_method=GradCAM):
+    """
+    Generate Grad-CAM heatmap. Accepts img_size and a cam_method to switch algorithms.
+    """
+    orig_np = np.array(orig_image.convert("RGB").resize((img_size, img_size))).astype(np.float32) / 255.0
+    cam = cam_method(model=model, target_layers=[target_layer])
+    targets = [ClassifierOutputTarget(class_idx)]
+    grayscale_cam = cam(input_tensor=image_tensor, targets=targets)[0, :]
     cam_image = show_cam_on_image(orig_np, grayscale_cam, use_rgb=True)
     pil_image = Image.fromarray(cam_image)
     buffered = BytesIO()
     pil_image.save(buffered, format="PNG")
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
 
-# --- BRAIN MRI ---
-def predict_brain(image: Image.Image, model):
-    image_rgb = image.convert("RGB") # Even if transform makes it grayscale, start with RGB
-    image_tensor = brain_transform(image_rgb).unsqueeze(0).to(device)
+def predict_model(image_tensor, model, labels):
     with torch.no_grad():
         outputs = model(image_tensor)
-        probs = nn.functional.softmax(outputs, dim=1).cpu().numpy()[0]
+        probs = F.softmax(outputs, dim=1).cpu().numpy()[0]
     predicted_idx = np.argmax(probs)
-    predicted_class = BRAIN_LABELS[predicted_idx]
-    confidence_score = float(probs[predicted_idx])
-    return predicted_class, confidence_score, probs, image_tensor
-
-def generate_brain_gradcam(model, image_tensor, target_layers, class_idx, orig_image: Image.Image):
-    rgb_img_float = np.array(orig_image.convert("RGB").resize((224, 224))) / 255.0
-    cam = GradCAM(model=model, target_layers=target_layers)
-    grayscale_cam = cam(input_tensor=image_tensor, targets=[ClassifierOutputTarget(class_idx)])[0, :]
-    cam_image = show_cam_on_image(rgb_img_float, grayscale_cam, use_rgb=True)
-    pil_image = Image.fromarray(cam_image)
-    buffered = BytesIO()
-    pil_image.save(buffered, format="PNG")
-    return base64.b64encode(buffered.getvalue()).decode("utf-8")
-
+    return labels[predicted_idx], float(probs[predicted_idx]), probs
 
 # =============================================================================
 # LOAD ALL MODELS ON STARTUP
 # =============================================================================
+print("🚀 AnYa Med AI Server starting up...")
+
 print(" * Loading Chest X-Ray model...")
 chest_model = load_chest_model()
 chest_target_layer = chest_model.features.denseblock4.denselayer16.conv2
@@ -128,14 +181,18 @@ print("✅ Chest X-Ray model loaded.")
 
 print(" * Loading Brain Tumor model...")
 brain_model = load_brain_model()
-brain_target_layer = [brain_model.features] # Grad-CAM for this model targets the whole feature block
+brain_target_layer = brain_model.features.denseblock4.denselayer16.conv2
 print("✅ Brain Tumor model loaded.")
 
+print(" * Loading Skin Lesion model...")
+skin_model = load_skin_model()
+skin_target_layer = skin_model.backbone.conv_head 
+print("✅ Skin Lesion model loaded.")
 
+print("🎉 All models loaded successfully. Server is ready.")
 # =============================================================================
 # API ENDPOINTS
 # =============================================================================
-
 def process_request(request, model_name):
     if 'image' not in request.files:
         return jsonify({"error": "No image file provided"}), 400
@@ -145,19 +202,40 @@ def process_request(request, model_name):
         return jsonify({"error": "No selected file"}), 400
         
     try:
-        image = Image.open(file.stream)
+        image = Image.open(file.stream).convert("RGB")
 
         if model_name == 'chest':
-            label, prob, all_probs, image_tensor = predict_chest(image, chest_model)
-            class_idx = CHEST_LABELS.index(label)
-            heatmap_base64 = generate_chest_gradcam(chest_model, image_tensor, chest_target_layer, class_idx, image)
+            image_tensor = process_image(image, chest_transform)
+            label, prob, all_probs = predict_model(image_tensor, chest_model, CHEST_LABELS)
             labels_list = CHEST_LABELS
+            class_idx = labels_list.index(label)
+            heatmap_base64 = generate_gradcam(
+                chest_model, chest_target_layer, image_tensor, image, class_idx, 
+                img_size=224, cam_method=GradCAMPlusPlus
+            )
         
         elif model_name == 'brain':
-            label, prob, all_probs, image_tensor = predict_brain(image, brain_model)
-            class_idx = BRAIN_LABELS.index(label)
-            heatmap_base64 = generate_brain_gradcam(brain_model, image_tensor, brain_target_layer, class_idx, image)
+            image_tensor = process_image(image, brain_transform)
+            label, prob, all_probs = predict_model(image_tensor, brain_model, BRAIN_LABELS)
             labels_list = BRAIN_LABELS
+            class_idx = labels_list.index(label)
+            heatmap_base64 = generate_gradcam(
+                brain_model, brain_target_layer, image_tensor, image, class_idx, 
+                img_size=224, cam_method=GradCAMPlusPlus
+            )
+
+        elif model_name == 'skin':
+            image_tensor = process_image(image, skin_transform)
+            label_short, prob, all_probs = predict_model(image_tensor, skin_model, SKIN_LABELS_SHORT)
+            label = SKIN_LABELS_FULL[label_short]
+            labels_list = [SKIN_LABELS_FULL[l] for l in SKIN_LABELS_SHORT]
+            class_idx = SKIN_LABELS_SHORT.index(label_short)
+            heatmap_base64 = generate_gradcam(
+                skin_model, skin_target_layer, image_tensor, image, class_idx, 
+                img_size=SKIN_IMG_SIZE
+            )
+        else:
+             return jsonify({"error": "Invalid model name specified"}), 400
 
         result = {
             "label": label,
@@ -172,6 +250,7 @@ def process_request(request, model_name):
 
     except Exception as e:
         print(f"❌ An error occurred during {model_name} prediction: {e}")
+        traceback.print_exc() # Print full traceback for easier debugging
         return jsonify({"error": f"An error occurred processing the image for {model_name}."}), 500
 
 @app.route("/api/chest", methods=["POST"])
@@ -184,9 +263,13 @@ def predict_brain_endpoint():
     """Endpoint for Brain Tumor (MRI) analysis."""
     return process_request(request, 'brain')
 
+@app.route("/api/skin", methods=["POST"])
+def predict_skin_endpoint():
+    """Endpoint for Skin Lesion analysis."""
+    return process_request(request, 'skin')
+
 # =============================================================================
 # RUN THE APP
 # =============================================================================
 if __name__ == "__main__":
-    # Use 0.0.0.0 to make it accessible from your Next.js app running in a container or on another device
     app.run(host="0.0.0.0", port=5000, debug=True)
