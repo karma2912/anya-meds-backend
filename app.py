@@ -28,7 +28,11 @@ from pytorch_grad_cam.utils.image import show_cam_on_image
 
 # --- Initialize Flask App ---
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "https://anya-meds.netlify.app"}})
+origins = [
+    "http://localhost:3000",
+    r"https?://.*\.netlify\.app" # A regular expression for all netlify.app subdomains
+]
+CORS(app, resources={r"/api/*": {"origins": origins}})
 
 # --- General Configuration ---
 MODEL_DIR = os.path.join(os.path.dirname(__file__), 'model')
