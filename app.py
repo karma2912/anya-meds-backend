@@ -8,17 +8,25 @@ import numpy as np
 import base64
 from io import BytesIO
 import traceback
+
+# --- NEW Imports for Gemini ---
 import google.generativeai as genai
 from dotenv import load_dotenv
+
+# Imports required for the Skin model
 import timm
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
+
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+
+# Grad-CAM libraries - Including GradCAMPlusPlus
 from pytorch_grad_cam import GradCAM, GradCAMPlusPlus
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
 from pytorch_grad_cam.utils.image import show_cam_on_image
 
+# --- Initialize Flask App ---
 app = Flask(__name__)
 origins = [
     "http://localhost:3000",
@@ -26,29 +34,37 @@ origins = [
 ]
 CORS(app, resources={r"/api/*": {"origins": origins}})
 
+# --- General Configuration ---
 MODEL_DIR = os.path.join(os.path.dirname(__file__), 'model')
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"✅ Using device: {device}")
 
+# --- NEW Configure Gemini API ---
 load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
-    print("⚠️ WARNING: GEMINI_API_KEY environment variable not set.")
+    print("⚠️ WARNING: GEMINI_API_KEY environment variable not set. AI Summaries will be disabled.")
 else:
     genai.configure(api_key=GEMINI_API_KEY)
     print("✅ Gemini API configured successfully.")
 
+# =============================================================================
+# SKIN LESION MODEL DEFINITION (Must be defined for loading)
+# =============================================================================
 class EnhancedModel(nn.Module):
-    # ... (Your EnhancedModel class definition remains the same) ...
+    """Enhanced model with better regularization and multi-scale features."""
     def __init__(self, model_name, num_classes, dropout_rate=0.3):
         super(EnhancedModel, self).__init__()
         self.backbone = timm.create_model(model_name, pretrained=True, num_classes=0, global_pool='')
+        
         with torch.no_grad():
             dummy_input = torch.randn(1, 3, 224, 224)
             features = self.backbone(dummy_input)
             feature_dim = features.shape[1]
+
         self.global_avg_pool = nn.AdaptiveAvgPool2d(1)
         self.global_max_pool = nn.AdaptiveMaxPool2d(1)
+
         self.classifier = nn.Sequential(
             nn.Dropout(dropout_rate),
             nn.Linear(feature_dim * 2, feature_dim),
@@ -61,6 +77,7 @@ class EnhancedModel(nn.Module):
             nn.Dropout(dropout_rate * 0.25),
             nn.Linear(feature_dim // 2, num_classes)
         )
+
     def forward(self, x):
         features = self.backbone(x)
         avg_pool = self.global_avg_pool(features).flatten(1)
@@ -68,27 +85,57 @@ class EnhancedModel(nn.Module):
         combined = torch.cat([avg_pool, max_pool], dim=1)
         return self.classifier(combined)
 
+# =============================================================================
+# MODEL CONFIGURATIONS
+# =============================================================================
+
+# CHEST X-RAY CONFIGURATION
 CHEST_MODEL_PATH = os.path.join(MODEL_DIR, "best_covid_model.pth")
 CHEST_LABELS = ['Normal', 'COVID', 'Lung_Opacity', 'Viral_Pneumonia']
-chest_transform = A.Compose([A.Resize(224, 224), A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]), ToTensorV2()])
+chest_transform = A.Compose([
+    A.Resize(224, 224),
+    A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ToTensorV2()
+])
+
+# BRAIN TUMOR (MRI) CONFIGURATION
 BRAIN_MODEL_PATH = os.path.join(MODEL_DIR, 'densenet_brain_tumor_v3.pth')
 BRAIN_LABELS = ['glioma', 'meningioma', 'notumor', 'pituitary']
-brain_transform = A.Compose([A.Resize(224, 224), A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]), ToTensorV2()])
+brain_transform = A.Compose([
+    A.Resize(224, 224),
+    A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ToTensorV2()
+])
+
+# SKIN LESION (DERMOSCOPY) CONFIGURATION
 SKIN_MODEL_PATH = os.path.join(MODEL_DIR, 'skin-model.pth')
 SKIN_MODEL_NAME = 'tf_efficientnet_b3.ns_jft_in1k'
 SKIN_IMG_SIZE = 256
 SKIN_NUM_CLASSES = 7
 SKIN_DROPOUT_RATE = 0.4
 SKIN_LABELS_SHORT = ['akiec', 'bcc', 'bkl', 'df', 'mel', 'nv', 'vasc']
-SKIN_LABELS_FULL = {'akiec': 'Actinic Keratoses', 'bcc': 'Basal Cell Carcinoma', 'bkl': 'Benign Keratosis-like Lesions', 'df': 'Dermatofibroma', 'mel': 'Melanoma', 'nv': 'Melanocytic Nevi', 'vasc': 'Vascular Lesions'}
-skin_transform = A.Compose([A.Resize(SKIN_IMG_SIZE, SKIN_IMG_SIZE), A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]), ToTensorV2()])
+SKIN_LABELS_FULL = {
+    'akiec': 'Actinic Keratoses', 'bcc': 'Basal Cell Carcinoma',
+    'bkl': 'Benign Keratosis-like Lesions', 'df': 'Dermatofibroma',
+    'mel': 'Melanoma', 'nv': 'Melanocytic Nevi', 'vasc': 'Vascular Lesions'
+}
+skin_transform = A.Compose([
+    A.Resize(SKIN_IMG_SIZE, SKIN_IMG_SIZE),
+    A.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ToTensorV2(),
+])
 
+# =============================================================================
+# LAZY LOADING SETUP
+# =============================================================================
 print("🚀 AnYa Med AI Server starting up...")
 chest_model, brain_model, skin_model = None, None, None
 print("🎉 Server is ready. Models will be loaded on demand.")
 
+# =============================================================================
+# MODEL LOADING & PREDICTION FUNCTIONS
+# =============================================================================
 def load_chest_model():
-    # ... (load_chest_model function is the same) ...
     model = models.densenet121(weights=None)
     model.classifier = nn.Linear(1024, len(CHEST_LABELS))
     checkpoint = torch.load(CHEST_MODEL_PATH, map_location=device)
@@ -98,7 +145,6 @@ def load_chest_model():
     return model
 
 def load_brain_model():
-    # ... (load_brain_model function is the same) ...
     model = models.densenet121(weights=None)
     model.classifier = nn.Linear(model.classifier.in_features, len(BRAIN_LABELS))
     model.load_state_dict(torch.load(BRAIN_MODEL_PATH, map_location=device))
@@ -107,19 +153,18 @@ def load_brain_model():
     return model
 
 def load_skin_model():
-    # ... (load_skin_model function is the same) ...
     model = EnhancedModel(model_name=SKIN_MODEL_NAME, num_classes=SKIN_NUM_CLASSES, dropout_rate=SKIN_DROPOUT_RATE)
     model.load_state_dict(torch.load(SKIN_MODEL_PATH, map_location=device))
     model.to(device)
     model.eval()
     return model
 
-# ... (process_image, generate_gradcam, predict_model, generate_ai_summary functions are the same) ...
 def process_image(image: Image.Image, transform):
     image_rgb = image.convert("RGB")
     image_np = np.array(image_rgb)
     transformed = transform(image=image_np)
     return transformed['image'].unsqueeze(0).to(device)
+
 def generate_gradcam(model, target_layer, image_tensor, orig_image: Image.Image, class_idx, img_size=224, cam_method=GradCAM):
     orig_np = np.array(orig_image.convert("RGB").resize((img_size, img_size))).astype(np.float32) / 255.0
     cam = cam_method(model=model, target_layers=[target_layer])
@@ -130,12 +175,14 @@ def generate_gradcam(model, target_layer, image_tensor, orig_image: Image.Image,
     buffered = BytesIO()
     pil_image.save(buffered, format="PNG")
     return base64.b64encode(buffered.getvalue()).decode("utf-8")
+
 def predict_model(image_tensor, model, labels):
     with torch.no_grad():
         outputs = model(image_tensor)
         probs = F.softmax(outputs, dim=1).cpu().numpy()[0]
     predicted_idx = np.argmax(probs)
     return labels[predicted_idx], float(probs[predicted_idx]), probs
+
 def generate_ai_summary(model_name, diagnosis, confidence):
     if not GEMINI_API_KEY:
         return "AI Summary feature is disabled. Please configure your Gemini API Key."
@@ -146,7 +193,7 @@ def generate_ai_summary(model_name, diagnosis, confidence):
     }
     prompt = prompts.get(model_name, f"Provide a brief summary for the medical finding: {diagnosis}")
     try:
-        model = genai.GenerativeModel('gemini-1.s5-flash-latest')
+        model = genai.GenerativeModel('gemini-1.5-flash-latest')
         response = model.generate_content(prompt)
         return response.text
     except Exception as e:
@@ -201,9 +248,11 @@ def process_request(request, model_name):
         
         ai_summary = generate_ai_summary(model_name, label, prob)
         result = {
-            "label": label, "confidence": round(prob, 4),
+            "label": label, 
+            "confidence": round(prob, 4),
             "probabilities": [{"label": labels_list[i], "value": round(float(p), 4)} for i, p in enumerate(all_probs)],
-            "heatmap": heatmap_base64, "ai_summary": ai_summary
+            "heatmap": heatmap_base64, 
+            "ai_summary": ai_summary
         }
         return jsonify(result)
     except Exception as e:
@@ -214,12 +263,14 @@ def process_request(request, model_name):
 @app.route("/api/chest", methods=["POST"])
 def predict_chest_endpoint():
     return process_request(request, 'chest')
+
 @app.route("/api/brain", methods=["POST"])
 def predict_brain_endpoint():
     return process_request(request, 'brain')
+
 @app.route("/api/skin", methods=["POST"])
 def predict_skin_endpoint():
     return process_request(request, 'skin')
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app.run(host="0.0.0.0", port=5000, debug=True)
