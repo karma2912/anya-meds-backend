@@ -203,6 +203,7 @@ def generate_ai_summary(model_name, diagnosis, confidence):
 def process_request(request, model_name):
     global chest_model, brain_model, skin_model
     if 'image' not in request.files:
+        patient_id = request.form.get('patientId')
         return jsonify({"error": "No image file provided"}), 400
     file = request.files['image']
     if file.filename == '':
