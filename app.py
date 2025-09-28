@@ -8,12 +8,12 @@ import numpy as np
 import base64
 from io import BytesIO
 import traceback
+import uuid  # <-- NEW IMPORT
+from werkzeug.utils import secure_filename  # <-- NEW IMPORT
 
-# --- NEW Imports for Gemini ---
 import google.generativeai as genai
 from dotenv import load_dotenv
 
-# Imports required for the Skin model
 import timm
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
@@ -21,12 +21,10 @@ from albumentations.pytorch import ToTensorV2
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-# Grad-CAM libraries - Including GradCAMPlusPlus
 from pytorch_grad_cam import GradCAM, GradCAMPlusPlus
 from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
 from pytorch_grad_cam.utils.image import show_cam_on_image
 
-# --- Initialize Flask App ---
 app = Flask(__name__)
 origins = [
     "http://localhost:3000",
@@ -165,23 +163,12 @@ def process_image(image: Image.Image, transform):
     transformed = transform(image=image_np)
     return transformed['image'].unsqueeze(0).to(device)
 
-def generate_gradcam(model, target_layer, image_tensor, orig_image: Image.Image, class_idx, img_size=224, cam_method=GradCAM):
-    orig_np = np.array(orig_image.convert("RGB").resize((img_size, img_size))).astype(np.float32) / 255.0
-    cam = cam_method(model=model, target_layers=[target_layer])
-    targets = [ClassifierOutputTarget(class_idx)]
-    grayscale_cam = cam(input_tensor=image_tensor, targets=targets)[0, :]
-    cam_image = show_cam_on_image(orig_np, grayscale_cam, use_rgb=True)
-    pil_image = Image.fromarray(cam_image)
-    buffered = BytesIO()
-    pil_image.save(buffered, format="PNG")
-    return base64.b64encode(buffered.getvalue()).decode("utf-8")
-
 def predict_model(image_tensor, model, labels):
     with torch.no_grad():
         outputs = model(image_tensor)
         probs = F.softmax(outputs, dim=1).cpu().numpy()[0]
-    predicted_idx = np.argmax(probs)
-    return labels[predicted_idx], float(probs[predicted_idx]), probs
+        predicted_idx = np.argmax(probs)
+        return labels[predicted_idx], float(probs[predicted_idx]), probs
 
 def generate_ai_summary(model_name, diagnosis, confidence):
     if not GEMINI_API_KEY:
@@ -200,16 +187,46 @@ def generate_ai_summary(model_name, diagnosis, confidence):
         print(f"❌ Gemini API Error: {e}")
         return "Could not generate AI summary due to an API error."
 
+# --- NEW HELPER FUNCTION to save the heatmap and return its path ---
+def generate_gradcam_and_save(model, target_layer, image_tensor, orig_image: Image.Image, class_idx, original_filename, img_size=224, cam_method=GradCAM):
+    orig_np = np.array(orig_image.convert("RGB").resize((img_size, img_size))).astype(np.float32) / 255.0
+    cam = cam_method(model=model, target_layers=[target_layer])
+    targets = [ClassifierOutputTarget(class_idx)]
+    grayscale_cam = cam(input_tensor=image_tensor, targets=targets)[0, :]
+    cam_image = show_cam_on_image(orig_np, grayscale_cam, use_rgb=True)
+    pil_image = Image.fromarray(cam_image)
+    
+    heatmap_filename = f"heatmap_{original_filename}"
+    upload_folder = os.path.join('static', 'uploads')
+    heatmap_path = os.path.join(upload_folder, heatmap_filename)
+    pil_image.save(heatmap_path)
+    print(f"✅ Saved heatmap to: {heatmap_path}")
+    
+    # --- FIXED LINE ---
+    return f"/static/uploads/{heatmap_filename}"
+
+# --- MODIFIED: This is the main request processing function ---
 def process_request(request, model_name):
     global chest_model, brain_model, skin_model
     if 'image' not in request.files:
-        patient_id = request.form.get('patientId')
         return jsonify({"error": "No image file provided"}), 400
+    
     file = request.files['image']
     if file.filename == '':
         return jsonify({"error": "No selected file"}), 400
+    
     try:
-        image = Image.open(file.stream).convert("RGB")
+        filename = secure_filename(f"{uuid.uuid4()}_{file.filename}")
+        upload_folder = os.path.join('static', 'uploads')
+        os.makedirs(upload_folder, exist_ok=True)
+        image_path = os.path.join(upload_folder, filename)
+        file.stream.seek(0)
+        file.save(image_path)
+        print(f"✅ Saved original image to: {image_path}")
+
+        image = Image.open(image_path).convert("RGB")
+        
+        # ... (your if/elif/else block for model prediction remains the same) ...
         if model_name == 'chest':
             if chest_model is None:
                 print(" * Loading Chest X-Ray model for the first time...")
@@ -218,48 +235,54 @@ def process_request(request, model_name):
             chest_target_layer = chest_model.features.denseblock4.denselayer16.conv2
             image_tensor = process_image(image, chest_transform)
             label, prob, all_probs = predict_model(image_tensor, chest_model, CHEST_LABELS)
-            labels_list = CHEST_LABELS
-            class_idx = labels_list.index(label)
-            heatmap_base64 = generate_gradcam(chest_model, chest_target_layer, image_tensor, image, class_idx, img_size=224, cam_method=GradCAMPlusPlus)
+            class_idx = CHEST_LABELS.index(label)
+            heatmap_path = generate_gradcam_and_save(chest_model, chest_target_layer, image_tensor, image, class_idx, filename, img_size=224, cam_method=GradCAMPlusPlus)
+        
         elif model_name == 'brain':
             if brain_model is None:
-                print(" * Loading Brain Tumor model for the first time...")
+                print(" * Loading Brain Tumor model...")
                 brain_model = load_brain_model()
-                print("✅ Brain Tumor model loaded.")
+                print("✅ Brain model loaded.")
             brain_target_layer = brain_model.features.denseblock4.denselayer16.conv2
             image_tensor = process_image(image, brain_transform)
             label, prob, all_probs = predict_model(image_tensor, brain_model, BRAIN_LABELS)
-            labels_list = BRAIN_LABELS
-            class_idx = labels_list.index(label)
-            heatmap_base64 = generate_gradcam(brain_model, brain_target_layer, image_tensor, image, class_idx, img_size=224, cam_method=GradCAMPlusPlus)
+            class_idx = BRAIN_LABELS.index(label)
+            heatmap_path = generate_gradcam_and_save(brain_model, brain_target_layer, image_tensor, image, class_idx, filename, img_size=224, cam_method=GradCAMPlusPlus)
+
         elif model_name == 'skin':
             if skin_model is None:
-                print(" * Loading Skin Lesion model for the first time...")
-                skin_model = load_skin_model()
-                print("✅ Skin Lesion model loaded.")
+                 print(" * Loading Skin Lesion model...")
+                 skin_model = load_skin_model()
+                 print("✅ Skin model loaded.")
             skin_target_layer = skin_model.backbone.conv_head
             image_tensor = process_image(image, skin_transform)
             label_short, prob, all_probs = predict_model(image_tensor, skin_model, SKIN_LABELS_SHORT)
             label = SKIN_LABELS_FULL[label_short]
-            labels_list = [SKIN_LABELS_FULL[l] for l in SKIN_LABELS_SHORT]
             class_idx = SKIN_LABELS_SHORT.index(label_short)
-            heatmap_base64 = generate_gradcam(skin_model, skin_target_layer, image_tensor, image, class_idx, img_size=SKIN_IMG_SIZE)
+            heatmap_path = generate_gradcam_and_save(skin_model, skin_target_layer, image_tensor, image, class_idx, filename, img_size=SKIN_IMG_SIZE, cam_method=GradCAM)
         else:
             return jsonify({"error": "Invalid model name specified"}), 400
-        
+            
         ai_summary = generate_ai_summary(model_name, label, prob)
+        
         result = {
-            "label": label, 
+            "diagnosis": label,
             "confidence": round(prob, 4),
-            "probabilities": [{"label": labels_list[i], "value": round(float(p), 4)} for i, p in enumerate(all_probs)],
-            "heatmap": heatmap_base64, 
+            # --- FIXED LINE ---
+            "image_url": f"/static/uploads/{filename}",
+            "heatmap_url": heatmap_path,
             "ai_summary": ai_summary
         }
         return jsonify(result)
+
     except Exception as e:
         print(f"❌ An error occurred during {model_name} prediction: {e}")
         traceback.print_exc()
         return jsonify({"error": f"An error occurred processing the image for {model_name}."}), 500
+
+# =============================================================================
+# API ENDPOINTS
+# =============================================================================
 
 @app.route("/api/chest", methods=["POST"])
 def predict_chest_endpoint():
