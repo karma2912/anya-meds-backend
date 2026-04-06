@@ -42,7 +42,7 @@ print(f"✅ Using device: {device}")
 
 # --- Configure Gemini API ---
 load_dotenv()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_API_KEY = "AIsdafasdfasfsdfsadfsaf"
 if not GEMINI_API_KEY:
     print("⚠️ WARNING: GEMINI_API_KEY environment variable not set. AI Summaries will be disabled.")
 else:
@@ -86,11 +86,7 @@ class EnhancedModel(nn.Module):
         combined = torch.cat([avg_pool, max_pool], dim=1)
         return self.classifier(combined)
 
-# =============================================================================
-# MODEL CONFIGURATIONS
-# =============================================================================
 
-# CHEST X-RAY CONFIGURATION
 CHEST_MODEL_PATH = os.path.join(MODEL_DIR, "best_covid_model.pth")
 CHEST_LABELS = ['Normal', 'COVID', 'Lung_Opacity', 'Viral_Pneumonia']
 chest_transform = A.Compose([
@@ -174,22 +170,36 @@ def predict_model(image_tensor, model, labels):
         return labels[predicted_idx], float(probs[predicted_idx]), probs
 
 def generate_ai_summary(model_name, diagnosis, confidence):
-    # Temporarily disable the API call by returning a placeholder immediately
-    # return "AI Summary feature is temporarily disabled. Please configure your Gemini API Key."
-    
-    # --- The original code is kept below but will not run ---
     if not GEMINI_API_KEY:
         return "AI Summary feature is disabled. Please configure your Gemini API Key."
-    prompts = {
-        "chest": f"As a medical scribe summarizing an AI analysis of a chest X-ray...",
-        "brain": f"As a medical scribe summarizing an AI analysis of a brain MRI...",
-        "skin": f"As a medical scribe summarizing an AI analysis of a dermoscopic image..."
-    }
-    prompt = prompts.get(model_name, f"Provide a brief summary for the medical finding: {diagnosis}")
+    
+    conf_pct = round(confidence * 100, 1)
+
+    prompt = f"""
+    You are an expert medical documentation AI assisting a physician. Write a concise clinical summary and suggested next steps for a recent {model_name} scan.
+    
+    SCAN DATA:
+    - Modality: {model_name.upper()}
+    - AI Predicted Finding: {diagnosis}
+    - AI Confidence Score: {conf_pct}%
+
+    STRICT RULES:
+    1. Write exactly two short paragraphs.
+    2. Paragraph 1 (Findings): State the primary finding and the AI's confidence level using standard objective medical terminology.
+    3. Paragraph 2 (Recommendations): Provide 1-2 standard clinical recommendations or next steps. 
+       - If confidence is below 75%, highly emphasize the need for manual radiologist review or repeat imaging.
+       - If confidence is high, suggest standard follow-up or clinical correlation guidelines for {diagnosis}.
+    4. DO NOT prescribe specific medications or dosages under any circumstances.
+    5. Always conclude the final sentence with a disclaimer stating these are AI-generated suggestions requiring physician approval.
+    6. DO NOT use conversational filler.
+    """
+
     try:
-        model = genai.GenerativeModel('gemini-1.5-flash-latest')
+        model = genai.GenerativeModel('gemini-2.5-flash')
         response = model.generate_content(prompt)
-        return response.text
+        
+        return response.text.strip() 
+        
     except Exception as e:
         print(f"❌ Gemini API Error: {e}")
         return "Could not generate AI summary due to an API error."
